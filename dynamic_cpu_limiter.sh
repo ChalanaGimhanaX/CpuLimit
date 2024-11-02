@@ -7,7 +7,14 @@ while true; do
     # Get the current total CPU usage by summing the CPU usage of all processes
     CURRENT_TOTAL_CPU=$(ps -eo pcpu --no-headers | awk '{sum+=$1} END {print sum}')
 
-    # If the current total CPU usage is already below the target, continue to the next iteration
+    # If the current total CPU usage is below the target by a significant margin, skip limiting
+    if (( $(echo "$CURRENT_TOTAL_CPU < $TARGET_CPU_USAGE - 10" | bc -l) )); then
+        echo "Current CPU usage ($CURRENT_TOTAL_CPU%) is well below the target ($TARGET_CPU_USAGE%). No action required."
+        sleep 1
+        continue
+    fi
+
+    # If the current total CPU usage is below the target, skip the limiting
     if (( $(echo "$CURRENT_TOTAL_CPU <= $TARGET_CPU_USAGE" | bc -l) )); then
         echo "Current CPU usage ($CURRENT_TOTAL_CPU%) is below the target ($TARGET_CPU_USAGE%). No action required."
         sleep 1
@@ -31,11 +38,12 @@ while true; do
         # Calculate the new CPU limit for this process based on the scaling factor
         NEW_LIMIT=$(echo "$cpu_usage * $SCALING_FACTOR" | bc -l)
 
-        # Limit the process to the new CPU limit using cpulimit
-        sudo cpulimit -p $pid -l ${NEW_LIMIT%.*} -b
-
-        # Log the change for debugging
-        echo "Process PID: $pid - Original CPU: $cpu_usage% - New CPU limit: ${NEW_LIMIT%.*}%"
+        # Only apply cpulimit if the calculated limit is below the original CPU usage
+        if (( $(echo "$NEW_LIMIT < $cpu_usage" | bc -l) )); then
+            sudo cpulimit -p $pid -l ${NEW_LIMIT%.*} -b
+            # Log the change for debugging
+            echo "Process PID: $pid - Original CPU: $cpu_usage% - New CPU limit: ${NEW_LIMIT%.*}%"
+        fi
     done
 
     echo "CPU limits applied to processes."
