@@ -64,7 +64,7 @@ log() {
 }
 
 # -------------------------------
-# Swap Memory Management
+# Swap Memory Management (Optional)
 # -------------------------------
 
 # Function to create swap if not present
@@ -94,24 +94,27 @@ get_cpu_cores() {
     nproc
 }
 
-# Function to calculate total CPU usage percentage
-get_total_cpu_usage() {
-    # Get CPU usage per core and calculate the average
-    awk -v cores="$1" '
-    /%Cpu/ {
-        idle = $8
-        total_idle += idle
-        count++
-    }
-    END {
-        if (count > 0) {
-            avg_idle = total_idle / count
-            usage = 100 - avg_idle
-            printf "%.2f", usage
-        } else {
-            print "0"
-        }
-    }' /proc/stat
+# Function to read /proc/stat and return idle and total CPU times
+read_cpu_times() {
+    awk '/^cpu / {idle=$5; total=0; for(i=2;i<=8;i++) total+=$i; print idle, total}' /proc/stat
+}
+
+# Function to calculate total CPU usage percentage based on two readings
+calculate_cpu_usage() {
+    local idle1=$1
+    local total1=$2
+    local idle2=$3
+    local total2=$4
+
+    local idle_diff=$(( idle2 - idle1 ))
+    local total_diff=$(( total2 - total1 ))
+
+    if [ $total_diff -eq 0 ]; then
+        echo "0"
+    else
+        cpu_usage=$(echo "scale=2; 100 * ($total_diff - $idle_diff) / $total_diff" | bc)
+        echo "$cpu_usage"
+    fi
 }
 
 # Function to limit CPU usage of a process
@@ -122,6 +125,18 @@ limit_cpu_usage() {
     # Ensure new_limit is at least 1%
     if (( $(echo "$new_limit < 1" | bc -l) )); then
         new_limit=1
+    fi
+
+    # Check if cpulimit is installed
+    if ! command -v cpulimit &> /dev/null; then
+        log "❌ cpulimit could not be found. Please install it using 'sudo apt-get install cpulimit'."
+        exit 1
+    fi
+
+    # Check if cpulimit is already limiting this PID
+    if pgrep -f "cpulimit.*-p $pid" > /dev/null; then
+        log "⚠️ cpulimit is already limiting PID $pid. Skipping."
+        return
     fi
 
     # Apply CPU limit using cpulimit in background
@@ -138,29 +153,41 @@ monitor_cpu() {
     local cpu_limit=$1
     local cpu_cores=$2
 
+    # Initial CPU times
+    read -r idle1 total1 < <(read_cpu_times)
+
+    # Sleep interval between measurements (in seconds)
+    sleep_interval=2
+
     while true; do
-        # Calculate total CPU usage
-        CURRENT_TOTAL_CPU=$(get_total_cpu_usage "$cpu_cores")
-        
+        # Read CPU times again after sleep interval
+        sleep "$sleep_interval"
+        read -r idle2 total2 < <(read_cpu_times)
+
+        # Calculate CPU usage
+        CURRENT_TOTAL_CPU=$(calculate_cpu_usage "$idle1" "$total1" "$idle2" "$total2")
+
+        # Update previous times for next iteration
+        idle1=$idle2
+        total1=$total2
+
         # Calculate target threshold with a margin (e.g., 10%)
         THRESHOLD=$(echo "$cpu_limit + 10" | bc -l)
 
         if (( $(echo "$CURRENT_TOTAL_CPU < $cpu_limit" | bc -l) )); then
             log "ℹ️ Current CPU usage (${CURRENT_TOTAL_CPU}%) is below the target (${cpu_limit}%). No action required."
-            sleep 5
             continue
         elif (( $(echo "$CURRENT_TOTAL_CPU > $THRESHOLD" | bc -l) )); then
             log "⚠️ Current CPU usage (${CURRENT_TOTAL_CPU}%) exceeds the threshold (${THRESHOLD}%). Initiating CPU limiting."
         else
             log "ℹ️ Current CPU usage (${CURRENT_TOTAL_CPU}%) is within acceptable limits."
-            sleep 5
             continue
         fi
 
         # Iterate over top CPU-consuming processes
         # Exclude this script and system processes to prevent self-throttling
-        ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | grep -vE "(${BASHPID}|systemd|sshd)" | while read -r pid cpu_usage comm; do
-            # Skip system processes and low CPU usage processes
+        ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | grep -vE "(${BASHPID}|systemd|sshd|bash|cpulimit)" | while read -r pid cpu_usage comm; do
+            # Skip processes with negligible CPU usage
             if (( $(echo "$cpu_usage < 1" | bc -l) )); then
                 continue
             fi
@@ -177,7 +204,6 @@ monitor_cpu() {
         done
 
         log "🔄 CPU limiting actions completed."
-        sleep 5
     done
 }
 
@@ -191,8 +217,8 @@ main() {
 
     log "🚀 Starting Dynamic CPU Limiter Service with a target CPU usage of ${cpu_limit}% across ${cpu_cores} cores."
 
-    # Start monitoring CPU usage
-    monitor_cpu "$cpu_limit" "$cpu_cores" &
+    # Start monitoring CPU usage in the foreground
+    monitor_cpu "$cpu_limit" "$cpu_cores"
 }
 
 # Start the main function
