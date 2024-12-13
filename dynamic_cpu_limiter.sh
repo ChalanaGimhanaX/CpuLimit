@@ -1,53 +1,199 @@
 #!/bin/bash
 
-# Define the target CPU usage you want to limit to (in percentage)
-TARGET_CPU_USAGE=50
+# dynamic_cpu_limiter.sh
+# Description: Dynamically limits CPU usage to prevent VPS throttling.
 
-while true; do
-    # Get the current total CPU usage by summing the CPU usage of all processes
-    CURRENT_TOTAL_CPU=$(ps -eo pcpu --no-headers | awk '{sum+=$1} END {print sum}')
+# -------------------------------
+# Configuration and Initialization
+# -------------------------------
 
-    # If the current total CPU usage is below the target by a significant margin, skip limiting
-    if (( $(echo "$CURRENT_TOTAL_CPU < $TARGET_CPU_USAGE - 10" | bc -l) )); then
-        echo "Current CPU usage ($CURRENT_TOTAL_CPU%) is well below the target ($TARGET_CPU_USAGE%). No action required."
-        sleep 1
-        continue
+# Default CPU usage limit (can be overridden by user input)
+DEFAULT_TARGET_CPU_USAGE=50
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 [-l CPU_LIMIT]"
+    echo "  -l CPU_LIMIT  Set the target CPU usage limit (in percentage). Default is $DEFAULT_TARGET_CPU_USAGE."
+    exit 1
+}
+
+# Parse command-line arguments
+while getopts ":l:h" opt; do
+  case ${opt} in
+    l )
+      TARGET_CPU_USAGE=$OPTARG
+      ;;
+    h )
+      usage
+      ;;
+    \? )
+      echo "Invalid Option: -$OPTARG" 1>&2
+      usage
+      ;;
+    : )
+      echo "Invalid Option: -$OPTARG requires an argument" 1>&2
+      usage
+      ;;
+  esac
+done
+shift $((OPTIND -1))
+
+# Set default if not provided
+TARGET_CPU_USAGE=${TARGET_CPU_USAGE:-$DEFAULT_TARGET_CPU_USAGE}
+
+# Ensure TARGET_CPU_USAGE is a valid number between 1 and 100
+if ! [[ "$TARGET_CPU_USAGE" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "Error: CPU limit must be a number."
+    usage
+fi
+
+if (( $(echo "$TARGET_CPU_USAGE < 1" | bc -l) )) || (( $(echo "$TARGET_CPU_USAGE > 100" | bc -l) )); then
+    echo "Error: CPU limit must be between 1 and 100."
+    usage
+fi
+
+# Log file path
+LOG_FILE="/var/log/dynamic_cpu_limiter.log"
+
+# Create log file if it doesn't exist
+touch "$LOG_FILE"
+
+# Function to log messages with timestamps
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
+}
+
+# -------------------------------
+# Swap Memory Management
+# -------------------------------
+
+# Function to create swap if not present
+create_swap() {
+    if swapon --show | grep -q "^/swapfile"; then
+        log "Swap is already enabled."
+    else
+        log "Creating swap memory..."
+        fallocate -l 1G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+        log "Swap memory created and enabled."
+    fi
+}
+
+# Uncomment the following line if you want the script to manage swap
+# create_swap
+
+# -------------------------------
+# CPU Usage Monitoring and Limiting
+# -------------------------------
+
+# Function to get total number of CPU cores
+get_cpu_cores() {
+    nproc
+}
+
+# Function to calculate total CPU usage percentage
+get_total_cpu_usage() {
+    # Get CPU usage per core and calculate the average
+    awk -v cores="$1" '
+    /%Cpu/ {
+        idle = $8
+        total_idle += idle
+        count++
+    }
+    END {
+        if (count > 0) {
+            avg_idle = total_idle / count
+            usage = 100 - avg_idle
+            printf "%.2f", usage
+        } else {
+            print "0"
+        }
+    }' /proc/stat
+}
+
+# Function to limit CPU usage of a process
+limit_cpu_usage() {
+    local pid=$1
+    local new_limit=$2
+
+    # Ensure new_limit is at least 1%
+    if (( $(echo "$new_limit < 1" | bc -l) )); then
+        new_limit=1
     fi
 
-    # If the current total CPU usage is below the target, skip the limiting
-    if (( $(echo "$CURRENT_TOTAL_CPU <= $TARGET_CPU_USAGE" | bc -l) )); then
-        echo "Current CPU usage ($CURRENT_TOTAL_CPU%) is below the target ($TARGET_CPU_USAGE%). No action required."
-        sleep 1
-        continue
+    # Apply CPU limit using cpulimit in background
+    cpulimit -p "$pid" -l "$new_limit" -b >/dev/null 2>&1 &
+    if [ $? -eq 0 ]; then
+        log "✅ Applied CPU limit of ${new_limit}% to PID $pid."
+    else
+        log "❌ Failed to apply CPU limit to PID $pid."
     fi
+}
 
-    # Calculate the scaling factor to reduce CPU usage (how much we need to reduce)
-    SCALING_FACTOR=$(echo "$TARGET_CPU_USAGE / $CURRENT_TOTAL_CPU" | bc -l)
+# Function to monitor and limit CPU usage
+monitor_cpu() {
+    local cpu_limit=$1
+    local cpu_cores=$2
 
-    echo "Current total CPU usage: $CURRENT_TOTAL_CPU%"
-    echo "Scaling factor: $SCALING_FACTOR"
-    echo "Applying new CPU limits to processes..."
+    while true; do
+        # Calculate total CPU usage
+        CURRENT_TOTAL_CPU=$(get_total_cpu_usage "$cpu_cores")
+        
+        # Calculate target threshold with a margin (e.g., 10%)
+        THRESHOLD=$(echo "$cpu_limit + 10" | bc -l)
 
-    # Iterate over all running processes, get their PID and CPU usage
-    ps -eo pid,pcpu --sort=-pcpu --no-headers | while read pid cpu_usage; do
-        # Skip the process if its CPU usage is 0
-        if (( $(echo "$cpu_usage <= 0" | bc -l) )); then
+        if (( $(echo "$CURRENT_TOTAL_CPU < $cpu_limit" | bc -l) )); then
+            log "ℹ️ Current CPU usage (${CURRENT_TOTAL_CPU}%) is below the target (${cpu_limit}%). No action required."
+            sleep 5
+            continue
+        elif (( $(echo "$CURRENT_TOTAL_CPU > $THRESHOLD" | bc -l) )); then
+            log "⚠️ Current CPU usage (${CURRENT_TOTAL_CPU}%) exceeds the threshold (${THRESHOLD}%). Initiating CPU limiting."
+        else
+            log "ℹ️ Current CPU usage (${CURRENT_TOTAL_CPU}%) is within acceptable limits."
+            sleep 5
             continue
         fi
 
-        # Calculate the new CPU limit for this process based on the scaling factor
-        NEW_LIMIT=$(echo "$cpu_usage * $SCALING_FACTOR" | bc -l)
+        # Iterate over top CPU-consuming processes
+        # Exclude this script and system processes to prevent self-throttling
+        ps -eo pid,pcpu,comm --sort=-pcpu --no-headers | grep -vE "(${BASHPID}|systemd|sshd)" | while read -r pid cpu_usage comm; do
+            # Skip system processes and low CPU usage processes
+            if (( $(echo "$cpu_usage < 1" | bc -l) )); then
+                continue
+            fi
 
-        # Only apply cpulimit if the calculated limit is below the original CPU usage
-        if (( $(echo "$NEW_LIMIT < $cpu_usage" | bc -l) )); then
-            sudo cpulimit -p $pid -l ${NEW_LIMIT%.*} -b
-            # Log the change for debugging
-            echo "Process PID: $pid - Original CPU: $cpu_usage% - New CPU limit: ${NEW_LIMIT%.*}%"
-        fi
+            # Calculate new CPU limit based on scaling factor
+            SCALING_FACTOR=$(echo "$cpu_limit / $CURRENT_TOTAL_CPU" | bc -l)
+            NEW_LIMIT=$(echo "$cpu_usage * $SCALING_FACTOR" | bc -l)
+            NEW_LIMIT_INT=$(printf "%.0f" "$NEW_LIMIT")
+
+            # Apply the CPU limit if necessary
+            if (( $(echo "$NEW_LIMIT < $cpu_usage" | bc -l) )); then
+                limit_cpu_usage "$pid" "$NEW_LIMIT_INT"
+            fi
+        done
+
+        log "🔄 CPU limiting actions completed."
+        sleep 5
     done
+}
 
-    echo "CPU limits applied to processes."
+# -------------------------------
+# Main Execution
+# -------------------------------
 
-    # Sleep for 1 second before repeating
-    sleep 1
-done
+main() {
+    local cpu_limit=$TARGET_CPU_USAGE
+    local cpu_cores=$(get_cpu_cores)
+
+    log "🚀 Starting Dynamic CPU Limiter Service with a target CPU usage of ${cpu_limit}% across ${cpu_cores} cores."
+
+    # Start monitoring CPU usage
+    monitor_cpu "$cpu_limit" "$cpu_cores" &
+}
+
+# Start the main function
+main
