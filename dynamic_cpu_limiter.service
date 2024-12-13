@@ -3,10 +3,12 @@ Description=Dynamic CPU Limiter Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/dynamic_cpu_limiter.sh
+ExecStart=/usr/local/bin/dynamic_cpu_limiter.sh -l 50
 Restart=always
 RestartSec=5s
 User=root
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
